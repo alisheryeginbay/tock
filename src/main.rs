@@ -32,6 +32,9 @@ enum Command {
         /// What you are doing
         #[arg(short, long, default_value = "")]
         description: String,
+        /// Tag the activity (repeatable)
+        #[arg(short = 'g', long = "tag", value_parser = parse_tag)]
+        tags: Vec<String>,
         #[command(flatten)]
         time: TimeArg,
     },
@@ -52,6 +55,9 @@ enum Command {
         /// Use a different description
         #[arg(short, long)]
         description: Option<String>,
+        /// Add a tag on top of the previous ones (repeatable)
+        #[arg(short = 'g', long = "tag", value_parser = parse_tag)]
+        tags: Vec<String>,
         #[command(flatten)]
         time: TimeArg,
     },
@@ -69,6 +75,12 @@ enum Command {
         /// New start time (HH:MM or "YYYY-MM-DD HH:MM")
         #[arg(short, long, group = "changes", value_parser = parse_time)]
         time: Option<NaiveDateTime>,
+        /// Add a tag (repeatable)
+        #[arg(short = 'g', long = "tag", group = "changes", value_parser = parse_tag)]
+        tags: Vec<String>,
+        /// Remove a tag (repeatable)
+        #[arg(long = "untag", group = "changes", value_parser = parse_tag)]
+        untags: Vec<String>,
     },
     /// Show running activities
     Current,
@@ -77,6 +89,9 @@ enum Command {
         /// Only count projects matching this pattern (* and ? allowed)
         #[arg(short, long)]
         project: Option<String>,
+        /// Only count activities with this tag (repeatable; all must match)
+        #[arg(short = 'g', long = "tag")]
+        tags: Vec<String>,
     },
     /// List activities
     #[command(visible_alias = "ls")]
@@ -94,6 +109,9 @@ enum Command {
     Report {
         #[command(flatten)]
         filter: Filter,
+        /// Group by tag instead of project (tagged time may be counted more than once)
+        #[arg(long)]
+        by_tag: bool,
     },
     /// Show recently used project/description pairs
     Last {
@@ -107,7 +125,13 @@ enum Command {
         #[arg(short, long)]
         current: bool,
     },
-    /// Find activities by project or description (* and ? allowed)
+    /// List tags
+    Tags {
+        /// Only tags of running activities
+        #[arg(short, long)]
+        current: bool,
+    },
+    /// Find activities by project, description or tag (* and ? allowed)
     Search {
         term: String,
     },
@@ -166,6 +190,9 @@ pub struct Filter {
     /// Only projects matching this pattern (* and ? allowed)
     #[arg(short, long)]
     pub project: Option<String>,
+    /// Only activities with this tag (repeatable; all must match, * and ? allowed)
+    #[arg(short = 'g', long = "tag")]
+    pub tags: Vec<String>,
     /// Round start and end times for display, e.g. 15m or 1h
     #[arg(long, value_parser = parse_round)]
     pub round: Option<i64>,
@@ -178,6 +205,10 @@ fn parse_time(s: &str) -> Result<NaiveDateTime, String> {
     }
     NaiveDateTime::parse_from_str(s, activity::TIME_FORMAT)
         .map_err(|_| format!("invalid time `{s}` (expected HH:MM or \"YYYY-MM-DD HH:MM\")"))
+}
+
+fn parse_tag(s: &str) -> Result<String, String> {
+    activity::parse_tag(s)
 }
 
 fn parse_round(s: &str) -> Result<i64, String> {
@@ -225,21 +256,24 @@ fn run() -> Result<()> {
 
     use commands as c;
     match cli.command {
-        Command::Start { project, description, time } => {
-            c::start(&path, project, description, time.time.unwrap_or(now))
+        Command::Start { project, description, tags, time } => {
+            c::start(&path, project, description, tags, time.time.unwrap_or(now))
         }
         Command::Stop { time } => c::stop(&path, time.time.unwrap_or(now)),
-        Command::Continue { number, project, description, time } => {
-            c::continue_(&path, number, project, description, time.time.unwrap_or(now))
+        Command::Continue { number, project, description, tags, time } => {
+            c::continue_(&path, number, project, description, tags, time.time.unwrap_or(now))
         }
         Command::Cancel => c::cancel(&path),
-        Command::Change { project, description, time } => c::change(&path, project, description, time),
+        Command::Change { project, description, time, tags, untags } => {
+            c::change(&path, project, description, time, tags, untags)
+        }
         Command::Current => c::current(&path, now),
-        Command::Status { project } => c::status(&path, project.as_deref(), now),
+        Command::Status { project, tags } => c::status(&path, project.as_deref(), &tags, now),
         Command::List { filter, number, no_grouping } => c::list(&path, &filter, number, !no_grouping, now),
-        Command::Report { filter } => c::report(&path, &filter, now),
+        Command::Report { filter, by_tag } => c::report(&path, &filter, by_tag, now),
         Command::Last { number } => c::last(&path, number),
         Command::Projects { current } => c::projects(&path, current),
+        Command::Tags { current } => c::tags(&path, current),
         Command::Search { term } => c::search(&path, &term, now),
         Command::Edit { editor } => c::edit(&path, editor),
         Command::Check => c::check(&path),

@@ -12,9 +12,9 @@ use crate::Filter;
 
 // ---------- recording ----------
 
-pub fn start(path: &Path, project: String, description: String, at: NaiveDateTime) -> Result<()> {
+pub fn start(path: &Path, project: String, description: String, tags: Vec<String>, at: NaiveDateTime) -> Result<()> {
     let mut log = Log::load(path)?;
-    begin(&mut log, Activity::new(at, project, description))
+    begin(&mut log, Activity::new(at, project, description, tags))
 }
 
 pub fn continue_(
@@ -22,13 +22,20 @@ pub fn continue_(
     number: usize,
     project: Option<String>,
     description: Option<String>,
+    tags: Vec<String>,
     at: NaiveDateTime,
 ) -> Result<()> {
     let mut log = Log::load(path)?;
-    let Some((p, d)) = recent_pairs(&log).into_iter().nth(number) else {
+    let Some(prev) = recent(&log).into_iter().nth(number) else {
         bail!("there is no recent activity #{number} (see `tock last`)");
     };
-    let activity = Activity::new(at, project.unwrap_or(p), description.unwrap_or(d));
+    let mut activity = Activity::new(
+        at,
+        project.unwrap_or_else(|| prev.project.clone()),
+        description.unwrap_or_else(|| prev.description.clone()),
+        prev.tags.clone(),
+    );
+    activity.add_tags(tags);
     begin(&mut log, activity)
 }
 
@@ -102,10 +109,14 @@ pub fn change(
     project: Option<String>,
     description: Option<String>,
     start: Option<NaiveDateTime>,
+    tags: Vec<String>,
+    untags: Vec<String>,
 ) -> Result<()> {
     let mut log = Log::load(path)?;
     let mut changed = Vec::new();
     for a in log.running_mut() {
+        a.tags.retain(|t| !untags.contains(t));
+        a.add_tags(tags.iter().cloned());
         if let Some(p) = &project {
             a.project = p.clone();
         }
@@ -141,7 +152,7 @@ pub fn current(path: &Path, now: NaiveDateTime) -> Result<()> {
     Ok(())
 }
 
-pub fn status(path: &Path, project: Option<&str>, now: NaiveDateTime) -> Result<()> {
+pub fn status(path: &Path, project: Option<&str>, tags: &[String], now: NaiveDateTime) -> Result<()> {
     let log = Log::load(path)?;
 
     let mut any = false;
@@ -167,7 +178,7 @@ pub fn status(path: &Path, project: Option<&str>, now: NaiveDateTime) -> Result<
         log.activities()
             .map(|(_, a)| a)
             .filter(|a| a.start.date() >= from && a.start.date() <= today)
-            .filter(|a| project.is_none_or(|p| glob_match(p, &a.project)))
+            .filter(|a| matches(a, project, tags))
             .map(|a| a.duration(now))
             .sum()
     };
@@ -199,7 +210,7 @@ pub fn list(path: &Path, filter: &Filter, number: Option<usize>, grouped: bool, 
     Ok(())
 }
 
-pub fn report(path: &Path, filter: &Filter, now: NaiveDateTime) -> Result<()> {
+pub fn report(path: &Path, filter: &Filter, by_tag: bool, now: NaiveDateTime) -> Result<()> {
     let log = Log::load(path)?;
     let acts = select(&log, filter, now);
     if acts.is_empty() {
@@ -207,54 +218,71 @@ pub fn report(path: &Path, filter: &Filter, now: NaiveDateTime) -> Result<()> {
         return Ok(());
     }
 
-    let mut projects: BTreeMap<&str, (Duration, BTreeMap<&str, Duration>)> = BTreeMap::new();
+    // Group -> (total, sub-group -> total). By project, sub-groups are descriptions;
+    // by tag, they are projects, and an activity counts once for each of its tags.
+    let mut groups: BTreeMap<String, (Duration, BTreeMap<String, Duration>)> = BTreeMap::new();
+    let mut add = |group: &str, sub: &str, d: Duration| {
+        let (total, subs) = groups.entry(group.to_string()).or_default();
+        *total += d;
+        *subs.entry(sub.to_string()).or_default() += d;
+    };
     for a in &acts {
         let d = a.duration(now);
-        let (total, descs) = projects.entry(&a.project).or_default();
-        *total += d;
-        *descs.entry(&a.description).or_default() += d;
+        if !by_tag {
+            add(&a.project, &a.description, d);
+        } else if a.tags.is_empty() {
+            add("(untagged)", &a.project, d);
+        } else {
+            for tag in &a.tags {
+                add(&format!("#{tag}"), &a.project, d);
+            }
+        }
     }
-    let grand: Duration = projects.values().map(|(t, _)| *t).sum();
+    let grand: Duration = acts.iter().map(|a| a.duration(now)).sum();
 
     let label = |d: &str| if d.is_empty() { "(no description)".to_string() } else { d.to_string() };
-    let label_w = projects
+    let label_w = groups
         .iter()
-        .flat_map(|(p, (_, ds))| std::iter::once(display::width(p)).chain(ds.keys().map(|d| 4 + display::width(&label(d)))))
+        .flat_map(|(g, (_, subs))| std::iter::once(display::width(g)).chain(subs.keys().map(|s| 4 + display::width(&label(s)))))
         .max()
         .unwrap_or(0)
         .max(30)
         + 3;
-    let dur_w = display::width(&duration(grand));
+    let longest = groups.values().map(|(t, _)| *t).max().unwrap_or(grand).max(grand);
+    let dur_w = display::width(&duration(longest));
     let line = |text: &str, d: Duration| {
         let dots = ".".repeat(label_w.saturating_sub(display::width(text) + 1));
         format!("{text} {} {}", dim(&dots), display::pad_left(&duration(d), dur_w))
     };
 
-    for (project, (total, descs)) in &projects {
-        println!("{}", bold(&line(project, *total)));
-        for (desc, d) in descs {
-            println!("{}", line(&format!("    {}", label(desc)), *d));
+    for (group, (total, subs)) in &groups {
+        println!("{}", bold(&line(group, *total)));
+        for (sub, d) in subs {
+            println!("{}", line(&format!("    {}", label(sub)), *d));
         }
         println!();
     }
     println!("{}", bold(&line("Total", grand)));
+    if by_tag && acts.iter().any(|a| a.tags.len() > 1) {
+        println!("{}", dim("Activities with several tags count under each, so tag totals can exceed the total."));
+    }
     Ok(())
 }
 
 pub fn last(path: &Path, number: usize) -> Result<()> {
     let log = Log::load(path)?;
-    let pairs = recent_pairs(&log);
-    if pairs.is_empty() {
+    let recent = recent(&log);
+    if recent.is_empty() {
         println!("No activities recorded yet.");
         return Ok(());
     }
-    let rows: Vec<Vec<String>> = pairs
+    let rows: Vec<Vec<String>> = recent
         .into_iter()
         .take(number)
         .enumerate()
-        .map(|(i, (p, d))| vec![format!("[{i}]"), d, p])
+        .map(|(i, a)| vec![format!("[{i}]"), a.description.clone(), a.project.clone(), tag_list(a)])
         .collect();
-    display::print_table(&["#", "Description", "Project"], &rows, false);
+    display::print_table(&["#", "Description", "Project", "Tags"], &rows, false);
     Ok(())
 }
 
@@ -274,13 +302,33 @@ pub fn projects(path: &Path, only_running: bool) -> Result<()> {
     Ok(())
 }
 
+pub fn tags(path: &Path, only_running: bool) -> Result<()> {
+    let log = Log::load(path)?;
+    let mut tags: Vec<&str> = log
+        .activities()
+        .map(|(_, a)| a)
+        .filter(|a| !only_running || a.is_running())
+        .flat_map(|a| a.tags.iter().map(String::as_str))
+        .collect();
+    tags.sort();
+    tags.dedup();
+    for t in tags {
+        println!("{t}");
+    }
+    Ok(())
+}
+
 pub fn search(path: &Path, term: &str, now: NaiveDateTime) -> Result<()> {
     let log = Log::load(path)?;
     let pattern = format!("*{term}*");
     let mut acts: Vec<Activity> = log
         .activities()
         .map(|(_, a)| a)
-        .filter(|a| glob_match(&pattern, &a.project) || glob_match(&pattern, &a.description))
+        .filter(|a| {
+            glob_match(&pattern, &a.project)
+                || glob_match(&pattern, &a.description)
+                || a.tags.iter().any(|t| glob_match(&pattern, t))
+        })
         .cloned()
         .collect();
     acts.sort_by_key(|a| a.start);
@@ -384,25 +432,39 @@ pub fn sanity(path: &Path, now: NaiveDateTime) -> Result<()> {
 // ---------- helpers ----------
 
 fn describe(a: &Activity) -> String {
-    if a.description.is_empty() {
+    let mut s = if a.description.is_empty() {
         format!("({})", a.project)
     } else {
         format!("\"{}\" ({})", a.description, a.project)
+    };
+    if !a.tags.is_empty() {
+        s.push(' ');
+        s.push_str(&tag_list(a));
     }
+    s
 }
 
-/// Distinct project/description pairs, most recently started first.
-fn recent_pairs(log: &Log) -> Vec<(String, String)> {
+fn tag_list(a: &Activity) -> String {
+    a.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" ")
+}
+
+/// Whether an activity matches a project pattern and every tag pattern.
+fn matches(a: &Activity, project: Option<&str>, tags: &[String]) -> bool {
+    project.is_none_or(|p| glob_match(p, &a.project))
+        && tags.iter().all(|pat| a.tags.iter().any(|t| glob_match(pat, t)))
+}
+
+/// The latest activity for each distinct project/description pair, most recent first.
+fn recent(log: &Log) -> Vec<&Activity> {
     let mut acts: Vec<&Activity> = log.activities().map(|(_, a)| a).collect();
     acts.sort_by_key(|a| std::cmp::Reverse(a.start));
-    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut seen: Vec<&Activity> = Vec::new();
     for a in acts {
-        let pair = (a.project.clone(), a.description.clone());
-        if !pairs.contains(&pair) {
-            pairs.push(pair);
+        if !seen.iter().any(|s| s.project == a.project && s.description == a.description) {
+            seen.push(a);
         }
     }
-    pairs
+    seen
 }
 
 fn date_range(f: &Filter, today: NaiveDate) -> (Option<NaiveDate>, Option<NaiveDate>) {
@@ -434,7 +496,7 @@ fn select(log: &Log, f: &Filter, now: NaiveDateTime) -> Vec<Activity> {
         .activities()
         .map(|(_, a)| a)
         .filter(|a| from.is_none_or(|d| a.start.date() >= d) && to.is_none_or(|d| a.start.date() <= d))
-        .filter(|a| f.project.as_deref().is_none_or(|p| glob_match(p, &a.project)))
+        .filter(|a| matches(a, f.project.as_deref(), &f.tags))
         .cloned()
         .map(|mut a| {
             if let Some(r) = f.round {
@@ -449,7 +511,12 @@ fn select(log: &Log, f: &Filter, now: NaiveDateTime) -> Vec<Activity> {
 }
 
 fn print_activities(acts: &[Activity], grouped: bool, now: NaiveDateTime) {
-    let header = ["Start", "End", "Description", "Project", "Duration"];
+    let show_tags = acts.iter().any(|a| !a.tags.is_empty());
+    let mut header = vec!["Start", "End", "Description", "Project"];
+    if show_tags {
+        header.push("Tags");
+    }
+    header.push("Duration");
     let row = |a: &Activity| {
         let start = if grouped { a.start.format("%H:%M") } else { a.start.format(TIME_FORMAT) };
         let end = match a.end {
@@ -457,7 +524,12 @@ fn print_activities(acts: &[Activity], grouped: bool, now: NaiveDateTime) {
             Some(e) if e.date() == a.start.date() => e.format("%H:%M").to_string(),
             Some(e) => e.format(TIME_FORMAT).to_string(),
         };
-        vec![start.to_string(), end, a.description.clone(), a.project.clone(), duration(a.duration(now))]
+        let mut row = vec![start.to_string(), end, a.description.clone(), a.project.clone()];
+        if show_tags {
+            row.push(tag_list(a));
+        }
+        row.push(duration(a.duration(now)));
+        row
     };
 
     if !grouped {

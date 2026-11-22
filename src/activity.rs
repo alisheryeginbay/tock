@@ -3,7 +3,9 @@
 //! Line format:
 //!   running:  `2026-11-22 09:00 | project | description`
 //!   finished: `2026-11-22 09:00 - 2026-11-22 10:30 | project | description`
+//!   tagged:   `2026-11-22 09:00 | project | description | billable, meeting`
 //! A literal `|` or `\` inside a field is written as `\|` or `\\`.
+//! Tags are lowercase and may not contain whitespace, `,` or `|`.
 
 use std::fmt;
 
@@ -17,11 +19,23 @@ pub struct Activity {
     pub end: Option<NaiveDateTime>,
     pub project: String,
     pub description: String,
+    pub tags: Vec<String>,
 }
 
 impl Activity {
-    pub fn new(start: NaiveDateTime, project: String, description: String) -> Self {
-        Activity { start: truncate(start), end: None, project, description }
+    pub fn new(start: NaiveDateTime, project: String, description: String, tags: Vec<String>) -> Self {
+        let mut a = Activity { start: truncate(start), end: None, project, description, tags: Vec::new() };
+        a.add_tags(tags);
+        a
+    }
+
+    /// Adds tags that aren't already present, keeping their order.
+    pub fn add_tags(&mut self, tags: impl IntoIterator<Item = String>) {
+        for tag in tags {
+            if !self.tags.contains(&tag) {
+                self.tags.push(tag);
+            }
+        }
     }
 
     pub fn is_running(&self) -> bool {
@@ -38,7 +52,7 @@ impl Activity {
         if fields.len() < 2 {
             return Err("expected `TIME | PROJECT [| DESCRIPTION]`".into());
         }
-        if fields.len() > 3 {
+        if fields.len() > 4 {
             return Err("too many fields (escape literal pipes as `\\|`)".into());
         }
 
@@ -53,8 +67,18 @@ impl Activity {
             return Err("project name is empty".into());
         }
         let description = fields.get(2).map(|d| d.trim().to_string()).unwrap_or_default();
+        let tags = match fields.get(3) {
+            Some(t) => t
+                .split(',')
+                .filter(|t| !t.trim().is_empty())
+                .map(parse_tag)
+                .collect::<Result<Vec<_>, _>>()?,
+            None => Vec::new(),
+        };
 
-        Ok(Activity { start, end, project, description })
+        let mut a = Activity { start, end, project, description, tags: Vec::new() };
+        a.add_tags(tags);
+        Ok(a)
     }
 }
 
@@ -65,8 +89,11 @@ impl fmt::Display for Activity {
             write!(f, " - {}", end.format(TIME_FORMAT))?;
         }
         write!(f, " | {}", escape(&self.project))?;
-        if !self.description.is_empty() {
+        if !self.description.is_empty() || !self.tags.is_empty() {
             write!(f, " | {}", escape(&self.description))?;
+        }
+        if !self.tags.is_empty() {
+            write!(f, " | {}", self.tags.join(", "))?;
         }
         Ok(())
     }
@@ -75,6 +102,18 @@ impl fmt::Display for Activity {
 /// Drops seconds so stored times match the minute precision of the file.
 pub fn truncate(t: NaiveDateTime) -> NaiveDateTime {
     t.with_second(0).and_then(|t| t.with_nanosecond(0)).unwrap_or(t)
+}
+
+/// Normalizes a tag to lowercase and rejects characters the file format can't hold.
+pub fn parse_tag(s: &str) -> Result<String, String> {
+    let tag = s.trim().trim_start_matches('#').to_lowercase();
+    if tag.is_empty() {
+        return Err("tag is empty".into());
+    }
+    if tag.chars().any(|c| c.is_whitespace() || c == ',' || c == '|') {
+        return Err(format!("invalid tag `{}` (no spaces, commas or pipes)", s.trim()));
+    }
+    Ok(tag)
 }
 
 fn parse_time(s: &str) -> Result<NaiveDateTime, String> {
@@ -136,7 +175,22 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_tags() {
+        let line = "2026-11-22 09:00 | work |  | billable, deep-work";
+        let a = Activity::parse(line).unwrap();
+        assert_eq!(a.description, "");
+        assert_eq!(a.tags, ["billable", "deep-work"]);
+        assert_eq!(a.to_string(), line);
+
+        let b = Activity::parse("2026-11-22 09:00 | work | x | Billable,billable, #Meeting").unwrap();
+        assert_eq!(b.tags, ["billable", "meeting"]);
+        assert_eq!(b.to_string(), "2026-11-22 09:00 | work | x | billable, meeting");
+    }
+
+    #[test]
     fn rejects_garbage() {
+        assert!(Activity::parse("2026-11-22 09:00 | x | y | two words").is_err());
+        assert!(Activity::parse("2026-11-22 09:00 | x | y | a | b").is_err());
         assert!(Activity::parse("hello").is_err());
         assert!(Activity::parse("2026-13-01 09:00 | x").is_err());
         assert!(Activity::parse("2026-11-22 09:00 |  | x").is_err());
